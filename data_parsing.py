@@ -160,7 +160,7 @@ def create_hist_perf_columns(source: pd.DataFrame) -> pd.DataFrame:
 
         past_games = source[
             (source['PLAYER_ID'] == row['PLAYER_ID']) &
-             (source['A_TEAM_ID'] == row['GAME_DATE']) &
+             (source['A_TEAM_ID'] == row['A_TEAM_ID']) &
              (source['GAME_DATE'] < row['GAME_DATE'])
         ]
 
@@ -279,7 +279,7 @@ def create_training_data() -> pd.DataFrame:
         etm_df = create_estimatedteammetrics_df()
         etm_df.to_csv('estimatedteammetrics.csv')
     
-    train_df = pgl_df[['PLAYER_ID', 'GAME_ID']]
+    train_df = pgl_df[['PLAYER_ID', 'GAME_ID', 'PTS']]
 
     cols_to_avg = ['PTS', 'FG_PCT', 'FG3_PCT', 'FT_PCT', 'REB', 'AST', 'STL', 'BLK']
     avg_df = create_avg_over_season_columns(pgl_df, cols_to_avg)
