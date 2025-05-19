@@ -1,7 +1,7 @@
 import pandas as pd
 from nba_api.stats.static import teams
 from nba_api.stats.endpoints import (playergamelogs, 
-                                     teamgamelogs, teamestimatedmetrics)
+                                     teamgamelogs, teamestimatedmetrics, playerestimatedmetrics)
 import numpy as np
 from typing import List
 import os
@@ -78,19 +78,39 @@ def create_weighted_average_columns(source: pd.DataFrame, names: List[str]) -> p
 
     wma_names = []
     for name in names:
-        wma_col_name = f"WMA_{name}_LAST_10"
+        wma_col_name = f"WMA_{name}_LAST_3"
         wma_names.append(wma_col_name)
 
         source[wma_col_name] = (
             source.groupby(['PLAYER_ID', 'SEASON_YEAR'])[name]
-            .rolling(window=10, min_periods=1)
+            .shift(1)
+            .rolling(window=3, min_periods=1)
             .apply(weighted_average, raw=True)
-            .reset_index(level=[0, 1], drop=True)
         )
     
     wma_names.extend(['PLAYER_ID', 'GAME_ID'])
 
     return source[wma_names]
+
+def create_useage_rate_column(p_source: pd.DataFrame, t_source: pd.DataFrame) -> pd.DataFrame:
+
+    t = t_source.rename(columns={'FTA': 'TFTA', 'FGA': 'TFGA', 'TOV': 'TTOV'})
+    t['TMIN'] = t['MIN'] * 5
+
+    useagelogs = p_source.merge(right=t[['TEAM_ID', 'GAME_ID', 'TFGA', 'TFTA', 'TTOV', 'TMIN']], how='left', on=['GAME_ID', 'TEAM_ID'])
+
+    useagelogs['USEAGE_RATE'] = ((100 * (useagelogs['FGA']) + (0.44 * useagelogs['FTA']) 
+                              + useagelogs['TOV']) * useagelogs['TMIN']) / ((useagelogs['TFGA'] + (0.44 * useagelogs['TFTA']) + useagelogs['TTOV']) * 5 * useagelogs['MIN'])
+    
+    useagelogs['UR_LAST_5'] = (
+        useagelogs.groupby(['PLAYER_ID', 'SEASON_YEAR'])['USEAGE_RATE']
+        .rolling(window=5, min_periods=1)
+        .apply(np.average, raw=True)
+        .reset_index(level=[0, 1], drop=True)
+    )
+
+    return useagelogs[['PLAYER_ID', 'GAME_ID', 'UR_LAST_5']]
+
 
 def create_fatigue_columns(source: pd.DataFrame) -> pd.DataFrame:
     """
@@ -141,7 +161,19 @@ def create_fatigue_columns(source: pd.DataFrame) -> pd.DataFrame:
     
     source['AWAY_GAMES_IN_A_ROW'] = source.groupby('PLAYER_ID', group_keys=False).apply(calc_away_streak)
 
-    return source[['PLAYER_ID', 'GAME_ID', 'HOME', 'GAMES_LAST_7_DAYS','AWAY_GAMES_IN_A_ROW']]
+    source.sort_values(by=['PLAYER_ID', 'GAME_DATE'], inplace=True)
+
+    source['MIN_LAST_3_DAYS'] = (
+        source.groupby('PLAYER_ID', group_keys=False)  # Prevents extra index levels
+        .apply(lambda x: 
+            x.groupby('GAME_DATE', as_index=False)['MIN'].sum()  # Aggregate by GAME_DATE
+            .set_index('GAME_DATE')['MIN']  # Now, each date has a single value
+            .rolling('3D', closed='left')  # 3-day rolling sum excluding current game
+            .sum()
+        ).fillna(0)
+    ).reset_index(level=0, drop=True) 
+
+    return source[['PLAYER_ID', 'GAME_ID', 'HOME', 'GAMES_LAST_7_DAYS','AWAY_GAMES_IN_A_ROW', 'MIN_LAST_3_DAYS']]
 
 def create_hist_perf_columns(source: pd.DataFrame) -> pd.DataFrame:
     source.rename(columns={'TEAM_ABBREVIATION': 'P_TEAM_ABBR'}, inplace=True)
@@ -160,12 +192,17 @@ def create_hist_perf_columns(source: pd.DataFrame) -> pd.DataFrame:
 
         past_games = source[
             (source['PLAYER_ID'] == row['PLAYER_ID']) &
-             (source['A_TEAM_ID'] == row['GAME_DATE']) &
+             (source['A_TEAM_ID'] == row['A_TEAM_ID']) &
              (source['GAME_DATE'] < row['GAME_DATE'])
         ]
 
         if past_games.empty:
-            avg = row['PTS']
+            # if there are no actual past games, look into any time performances
+            games = source[
+            (source['PLAYER_ID'] == row['PLAYER_ID']) &
+             (source['A_TEAM_ID'] == row['TEAM_ID'])
+            ]
+            avg = games['PTS'].mean()
         else:
             avg = past_games['PTS'].mean()
         historic_vs_team.append(avg)
@@ -259,6 +296,8 @@ def create_team_stats_columns(p_source: pd.DataFrame, t_source, est_df: pd.DataF
                      'OPP_WMA_PTS_ALLOWED', 'OPP_PTS_ALLOWED', 'PLAYER_TEAM_PACE', 
                      'PLAYER_TEAM_OFF_RATING', 'OPP_TEAM_PACE', 'OPP_DEF_RATING']]
 
+
+
 def create_training_data() -> pd.DataFrame:
 
     if os.path.exists('playergamelogs.csv'):
@@ -278,24 +317,30 @@ def create_training_data() -> pd.DataFrame:
     else:
         etm_df = create_estimatedteammetrics_df()
         etm_df.to_csv('estimatedteammetrics.csv')
-    
-    train_df = pgl_df[['PLAYER_ID', 'GAME_ID']]
 
-    cols_to_avg = ['PTS', 'FG_PCT', 'FG3_PCT', 'FT_PCT', 'REB', 'AST', 'STL', 'BLK']
+    
+    train_df = pgl_df[['PLAYER_ID', 'GAME_ID', 'PTS']]
+
+    cols_to_avg = ['PTS', 'FGA', 'FG3A', 'FTA', 'REB', 'AST', 'STL', 'BLK']
     avg_df = create_avg_over_season_columns(pgl_df, cols_to_avg)
 
-    wma_names = ['PTS', 'FG_PCT', 'FG3_PCT', 'FT_PCT', 'MIN']
+    wma_names = ['PTS', 'FGA', 'FG3A', 'FTA', 'MIN', 'FT_PCT']
     wma_df = create_weighted_average_columns(pgl_df, wma_names)
 
     fat_df = create_fatigue_columns(source=pgl_df)
     hist_df = create_hist_perf_columns(source=pgl_df)
     team_stats_df = create_team_stats_columns(pgl_df, tgl_df, etm_df)
+    ur_df = create_useage_rate_column(pgl_df, tgl_df)
 
     train_df = train_df.merge(avg_df, how='left', on=['PLAYER_ID', 'GAME_ID'])
     train_df = train_df.merge(wma_df, how='left', on=['PLAYER_ID', 'GAME_ID'])
     train_df = train_df.merge(fat_df, how='left', on=['PLAYER_ID', 'GAME_ID'])
     train_df = train_df.merge(hist_df, how='left', on=['PLAYER_ID', 'GAME_ID'])
     train_df = train_df.merge(team_stats_df, how='left', on=['PLAYER_ID', 'GAME_ID'])
+    train_df = train_df.merge(ur_df, how='left', on=['PLAYER_ID', 'GAME_ID'])
+
+    train_df['EST_GAME_PACE'] = (train_df['PLAYER_TEAM_PACE'] + train_df['OPP_TEAM_PACE']) / 2
+    train_df.drop(columns=['PLAYER_TEAM_PACE', 'OPP_TEAM_PACE'], inplace=True)
 
     return train_df
 
