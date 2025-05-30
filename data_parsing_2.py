@@ -100,7 +100,15 @@ def weighted_average(series):
 # Adjusted home/away performance
 # playoff flag
 def create_pysch_features(source: pd.DataFrame):
+    # HOME field
     source['HOME'] = np.where(source['MATCHUP'].str.contains('@'), 0, 1)
+
+    season_avg_pts = (
+        source.groupby(['PLAYER_ID', 'SEASON_YEAR'])['PTS']
+        .mean()
+        .reset_index()
+        .rename(columns={'PTS': 'SEASON_AVG_PTS'})
+    )
 
     home_away_avg = (
         source.groupby(['PLAYER_ID', 'SEASON_YEAR', 'HOME'])['PTS']
@@ -111,10 +119,25 @@ def create_pysch_features(source: pd.DataFrame):
     )
 
     source = source.merge(home_away_avg, on=['PLAYER_ID', 'SEASON_YEAR'], how='left')
+    source = source.merge(season_avg_pts, on=['PLAYER_ID', 'SEASON_YEAR'], how='left')
 
+
+    # calculates how different the player is playing at home vs away
     source['HOME_AWAY_DIFF'] = source['HOME_PERF'] - source['AWAY_PERF']
     source['HOME_AWAY_DIFF'].fillna(0, inplace=True)
-    return source[['HOME_AWAY_DIFF', 'HOME', 'PLAYER_ID', 'GAME_ID']]
+
+    source['HOME_AWAY_RATIO'] = np.where(
+        source['SEASON_AVG_PTS'] > 0,
+        source['HOME_AWAY_DIFF'] / source['SEASON_AVG_PTS'],
+        0
+    )
+
+    q3 = source['HOME_AWAY_RATIO'].abs().quantile(0.75)
+
+    source['HOME_AWAY_MEANINGFUL'] = (source['HOME_AWAY_RATIO'].abs() > q3).astype(int)
+    source['HOME_AWAY_RATIO'] = source['HOME_AWAY_RATIO'].clip(-1.0, 1.0)
+
+    return source[['HOME_AWAY_RATIO', 'HOME_AWAY_MEANINGFUL','HOME', 'PLAYER_ID', 'GAME_ID']]
 
 
 
@@ -133,8 +156,8 @@ def create_useage_rate_column(p_source: pd.DataFrame, t_source: pd.DataFrame) ->
     return useagelogs[['UR', 'GAME_ID', 'PLAYER_ID']]
 
 def main():
-    team_df = pd.read_csv('teamgamelogs.csv')
-    player_df = pd.read_csv('playergamelogs.csv')
+    team_df = pd.read_csv('nba_api_data/teamgamelogs.csv')
+    player_df = pd.read_csv('nba_api_data/playergamelogs.csv')
 
     player_df = player_df.merge(right=create_useage_rate_column(player_df, team_df), how='left', on=['PLAYER_ID', 'GAME_ID'])
 
@@ -154,6 +177,10 @@ def main():
     std_10_df = create_stat_columns(player_df, col_names, 10, 'STD', np.std)
 
     psy_df = create_pysch_features(player_df)
+
+    starter_df = pd.read_csv('nba_api_data/lineupdata.csv')
+    starter_df = starter_df[['GAME_ID', 'PLAYER_ID', 'STARTED']]
+    train_df = train_df.merge(starter_df, how='left', on=['PLAYER_ID', 'GAME_ID'])
 
 
     train_df = train_df.merge(wma_3_df, how='left', on=['PLAYER_ID', 'GAME_ID'])
